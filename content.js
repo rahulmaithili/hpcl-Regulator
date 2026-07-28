@@ -34,6 +34,9 @@ function initAutofiller() {
 
     // Create & Inject Control Panel
     injectAutofillPanel();
+    
+    // Auto-sync CML list in the background
+    syncCmlsSilently();
 }
 
 // ==========================================================================
@@ -48,7 +51,7 @@ function injectAutofillPanel() {
     panel.id = "hpcl-autofill-panel";
     panel.innerHTML = `
         <div class="panel-handle">
-            <span class="panel-title">⚡ Mr.Rahul Script</span>
+            <span class="panel-title">⚡ HPCL Autofiller</span>
             <button id="btn-toggle-widget" title="Minimize/Maximize">−</button>
         </div>
         <div id="widget-body" class="widget-body">
@@ -64,6 +67,27 @@ function injectAutofillPanel() {
             <div id="file-info" class="file-info hidden">
                 <span id="file-name" class="file-name">template.csv</span>
                 <span id="file-rows" class="file-rows">0 rows loaded</span>
+            </div>
+
+            <!-- CML Numbers List Section -->
+            <div class="cml-section" style="border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 8px; background: rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; gap: 6px;">
+                <div class="cml-header" style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 11px; font-weight: 600; color: #9ca3af;">📋 CML List (Fallback)</span>
+                    <button id="btn-sync-cmls" title="Sync CML List from GitHub" style="background: #2563eb; border: none; color: white; border-radius: 4px; padding: 2px 6px; font-size: 9px; cursor: pointer; display: flex; align-items: center; gap: 3px; font-weight: 600;">
+                        🔄 Sync from GitHub
+                    </button>
+                </div>
+                <div id="cml-display-area" style="font-size: 10px; color: #10b981; background: #0b0f19; border: 1px solid #1f2937; border-radius: 4px; padding: 6px; max-height: 70px; overflow-y: auto; cursor: pointer; font-family: monospace; line-height: 1.4;" title="Click to edit list manually">
+                    <!-- Dynamic list of CML numbers -->
+                </div>
+                <div id="cml-edit-area" style="display: none; flex-direction: column; gap: 6px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px;">
+                    <span style="font-size: 9px; color: #9ca3af;">Enter one CML per line: CML_Number, Manufacturer (Optional)</span>
+                    <textarea id="txt-cml-list" style="width: 100%; height: 80px; background: #0b0f19; border: 1px solid #374151; color: #f3f4f6; font-family: monospace; font-size: 10px; padding: 4px; border-radius: 4px; resize: vertical; outline: none;"></textarea>
+                    <div style="display: flex; justify-content: flex-end; gap: 6px;">
+                        <button id="btn-cancel-cmls" style="background: #4b5563; color: white; border: none; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer; font-weight: 500;">Cancel</button>
+                        <button id="btn-save-cmls" style="background: #10b981; color: white; border: none; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer; font-weight: 500;">Save</button>
+                    </div>
+                </div>
             </div>
 
             <div class="widget-buttons">
@@ -88,7 +112,7 @@ function injectAutofillPanel() {
             <div id="autofill-log" class="autofill-log hidden"></div>
             
             <div style="text-align: center; font-size: 9px; color: #6b7280; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 8px; margin-top: 4px;">
-                Copyright © Mr.Rahul Script. All Rights Reserved.
+                Copyright © HPCL Autofiller. All Rights Reserved.
             </div>
         </div>
     `;
@@ -103,6 +127,15 @@ function injectAutofillPanel() {
     document.getElementById("autofill-file-input").addEventListener("change", handleFileSelected);
     document.getElementById("btn-start-autofill").addEventListener("click", startAutofillProcess);
     document.getElementById("btn-stop-autofill").addEventListener("click", stopAutofillProcess);
+    
+    // CML list event bindings
+    document.getElementById("btn-sync-cmls").addEventListener("click", syncCmlsFromGitHub);
+    document.getElementById("cml-display-area").addEventListener("click", showCmlEditor);
+    document.getElementById("btn-cancel-cmls").addEventListener("click", hideCmlEditor);
+    document.getElementById("btn-save-cmls").addEventListener("click", saveCmlManualInput);
+
+    // Initial render of CML list
+    renderCmlList();
 
     // Restore state if saved in localStorage
     restoreStateFromStorage();
@@ -560,17 +593,137 @@ function generateRandomBatchNo() {
     return ab + month + year;
 }
 
-function generateRandomCmlNo() {
-    // Specific registered supplier CM/L numbers provided by the user
-    const validCmls = [
-        "9354585",    // United Associates
-        "8230360",    // Mauria Udyog Ltd
-        "8926296",    // Raghav Die Casting
-        "9205063",    // Hari Engineering Works
-        "8700103212"  // Shivansh Machinery Company LLP
+function getCmlList() {
+    const saved = localStorage.getItem("hpcl_autofill_custom_cmls");
+    if (saved) {
+        try {
+            return JSON.parse(saved);
+        } catch (e) {}
+    }
+    return [
+        { number: "9354585", name: "United Associates" },
+        { number: "8230360", name: "Mauria Udyog Ltd" },
+        { number: "8926296", name: "Raghav Die Casting" },
+        { number: "9205063", name: "Hari Engineering Works" },
+        { number: "8700103212", name: "Shivansh Machinery Company LLP" }
     ];
-    const index = Math.floor(Math.random() * validCmls.length);
-    return validCmls[index];
+}
+
+function generateRandomCmlNo() {
+    const cmls = getCmlList();
+    if (cmls.length === 0) return "";
+    const index = Math.floor(Math.random() * cmls.length);
+    return cmls[index].number;
+}
+
+function renderCmlList() {
+    const displayArea = document.getElementById("cml-display-area");
+    if (!displayArea) return;
+    
+    const list = getCmlList();
+    if (list.length === 0) {
+        displayArea.innerHTML = "<span style='color:#ef4444;'>No CML numbers. Click to add.</span>";
+        return;
+    }
+    
+    displayArea.innerHTML = list.map(item => {
+        return `<div>• ${item.number} ${item.name ? `(${item.name})` : ''}</div>`;
+    }).join('');
+}
+
+function showCmlEditor() {
+    const displayArea = document.getElementById("cml-display-area");
+    const editArea = document.getElementById("cml-edit-area");
+    const txtArea = document.getElementById("txt-cml-list");
+    
+    displayArea.style.display = "none";
+    editArea.style.display = "flex";
+    
+    const list = getCmlList();
+    txtArea.value = list.map(item => {
+        return `${item.number}${item.name ? `, ${item.name}` : ''}`;
+    }).join('\n');
+    txtArea.focus();
+}
+
+function hideCmlEditor() {
+    const displayArea = document.getElementById("cml-display-area");
+    const editArea = document.getElementById("cml-edit-area");
+    
+    displayArea.style.display = "block";
+    editArea.style.display = "none";
+}
+
+function saveCmlManualInput() {
+    const txtArea = document.getElementById("txt-cml-list");
+    const lines = txtArea.value.split('\n');
+    const newList = [];
+    
+    lines.forEach(line => {
+        const cleanLine = line.trim();
+        if (!cleanLine) return;
+        
+        const parts = cleanLine.split(',');
+        const number = parts[0].trim();
+        const name = parts[1] ? parts[1].trim() : '';
+        
+        if (number) {
+            newList.push({ number, name });
+        }
+    });
+    
+    localStorage.setItem("hpcl_autofill_custom_cmls", JSON.stringify(newList));
+    renderCmlList();
+    hideCmlEditor();
+    log("Saved CML list manually.");
+}
+
+async function syncCmlsFromGitHub() {
+    const btn = document.getElementById("btn-sync-cmls");
+    const originalText = btn.textContent;
+    btn.textContent = "⌛ Syncing...";
+    btn.disabled = true;
+    
+    log("Fetching latest CML list from GitHub...");
+    
+    try {
+        const response = await fetch("https://rahulmaithili.github.io/hpcl-Regulator/cml_list.json", { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        if (Array.isArray(data)) {
+            localStorage.setItem("hpcl_autofill_custom_cmls", JSON.stringify(data));
+            log(`Synced ${data.length} CMLs from GitHub successfully.`);
+            renderCmlList();
+            alert(`CML list updated successfully! Loaded ${data.length} items from GitHub.`);
+        } else {
+            throw new Error("Invalid data format. Expected an array.");
+        }
+    } catch (e) {
+        log(`❌ Sync failed: ${e.message}`);
+        console.error(e);
+        alert(`Failed to sync from GitHub: ${e.message}\nUsing your local CML list instead.`);
+    } finally {
+        btn.textContent = originalText;
+        btn.disabled = false;
+    }
+}
+
+async function syncCmlsSilently() {
+    try {
+        const response = await fetch("https://rahulmaithili.github.io/hpcl-Regulator/cml_list.json", { cache: "no-store" });
+        if (response.ok) {
+            const data = await response.json();
+            if (Array.isArray(data)) {
+                localStorage.setItem("hpcl_autofill_custom_cmls", JSON.stringify(data));
+                renderCmlList();
+                console.log("Silently updated CML list from GitHub.");
+            }
+        }
+    } catch (e) {
+        console.warn("Silent CML sync failed:", e);
+    }
 }
 
 function determineRemarksFromDefect(defectType) {
