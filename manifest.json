@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "HPCL LPG Tech Audit Autofiller",
+  "version": "1.0",
+  "description": "Autofills the HPCL Distributor Request Form from a local CSV sheet.",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://lpgtechaudit.hpcl.co.in/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}
