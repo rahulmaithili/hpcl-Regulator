@@ -687,7 +687,7 @@ async function syncCmlsFromGitHub() {
     log("Fetching latest CML list from GitHub...");
     
     try {
-        const response = await fetch("https://rahulmaithili.github.io/hpcl-Regulator/cml_list.json", { cache: "no-store" });
+        const response = await fetch("https://raw.githubusercontent.com/rahulmaithili/hpcl-Regulator/main/cml_list.json", { cache: "no-store" });
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -712,7 +712,7 @@ async function syncCmlsFromGitHub() {
 
 async function syncCmlsSilently() {
     try {
-        const response = await fetch("https://rahulmaithili.github.io/hpcl-Regulator/cml_list.json", { cache: "no-store" });
+        const response = await fetch("https://raw.githubusercontent.com/rahulmaithili/hpcl-Regulator/main/cml_list.json", { cache: "no-store" });
         if (response.ok) {
             const data = await response.json();
             if (Array.isArray(data)) {
