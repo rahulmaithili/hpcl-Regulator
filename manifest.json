@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "HPCL LPG Tech Audit Autofiller",
-  "version": "1.0",
+  "version": "1.0.1",
+  "update_url": "https://rahulmaithili.github.io/hpcl-Regulator/updates.xml",
   "description": "Autofills the HPCL Distributor Request Form from a local CSV sheet.",
   "permissions": ["activeTab"],
   "content_scripts": [
