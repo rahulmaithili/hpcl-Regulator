@@ -24,7 +24,7 @@ const LW_VERIFY_URL = "https://licensescript.netlify.app/api/verify-license";
 const LW_PORTAL_URL = "https://licensescript.netlify.app/";
 const LW_STORAGE_KEY = "hpcl_autofiller_license";
 const LW_DEVICE_KEY = "hpcl_autofiller_device_id";
-const LW_RECHECK_MS = 3 * 60 * 60 * 1000; // re-verify every 3 hours
+const LW_RECHECK_MS = 30 * 60 * 1000; // re-verify every 30 minutes (high-security: revoked keys stop within ~30 min)
 const LW_OFFLINE_GRACE_MS = 24 * 60 * 60 * 1000; // 24h offline grace
 const LW_EXPIRY_GRACE_DAYS = 3; // server-side grace window after expiry
 
