@@ -9,6 +9,346 @@ let isAutofilling = false;
 let currentFillIndex = 0;
 const BATCH_SIZE = 25;
 
+// ==========================================================================
+// 0. LicenseWala License Gating
+// Activation succeeds ONLY on a server-verified response from
+// https://licensescript.netlify.app/api/verify-license. There is no trial
+// key, no localhost fallback, no sandbox mode and no hard-coded valid key.
+// A previously verified user keeps working through transient network
+// failures for up to 24h after the last successful verification (offline
+// grace); after that, or when the server reports the key invalid /
+// expired / revoked / locked / over its device limit, the panel locks
+// until a fresh verification succeeds.
+// ==========================================================================
+const LW_VERIFY_URL = "https://licensescript.netlify.app/api/verify-license";
+const LW_PORTAL_URL = "https://licensescript.netlify.app/";
+const LW_STORAGE_KEY = "hpcl_autofiller_license";
+const LW_DEVICE_KEY = "hpcl_autofiller_device_id";
+const LW_RECHECK_MS = 3 * 60 * 60 * 1000; // re-verify every 3 hours
+const LW_OFFLINE_GRACE_MS = 24 * 60 * 60 * 1000; // 24h offline grace
+const LW_EXPIRY_GRACE_DAYS = 3; // server-side grace window after expiry
+
+let lwLicense = null; // stored verified license object, or null
+let lwLicensed = false; // fail closed: false until a check says otherwise
+let lwLockedMessage = "";
+let lwReverifyTimer = null;
+let lwReverifying = false;
+
+function lwStorageGet(key) {
+    return new Promise((resolve) => {
+        try {
+            if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+                chrome.storage.local.get([key], (res) => {
+                    resolve(res ? res[key] : undefined);
+                });
+                return;
+            }
+        } catch (e) { /* fall through to localStorage */ }
+        try {
+            const raw = localStorage.getItem(key);
+            resolve(raw ? JSON.parse(raw) : undefined);
+        } catch (e) {
+            resolve(undefined);
+        }
+    });
+}
+
+function lwStorageSet(obj) {
+    return new Promise((resolve) => {
+        try {
+            if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+                chrome.storage.local.set(obj, () => resolve());
+                return;
+            }
+        } catch (e) { /* fall through to localStorage */ }
+        try {
+            Object.keys(obj).forEach((k) => localStorage.setItem(k, JSON.stringify(obj[k])));
+        } catch (e) { /* storage unavailable: license simply will not persist */ }
+        resolve();
+    });
+}
+
+function lwStorageRemove(key) {
+    return new Promise((resolve) => {
+        try {
+            if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+                chrome.storage.local.remove([key], () => resolve());
+                return;
+            }
+        } catch (e) { /* fall through to localStorage */ }
+        try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
+        resolve();
+    });
+}
+
+async function lwGetDeviceId() {
+    let id = await lwStorageGet(LW_DEVICE_KEY);
+    if (typeof id === "string" && id) return id;
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    id = "HPCL-" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+    await lwStorageSet({ [LW_DEVICE_KEY]: id });
+    return id;
+}
+
+function lwExpiryMs(lic) {
+    if (!lic || !lic.expires_at) return null;
+    if (String(lic.expires_at).startsWith("9999")) return Infinity; // lifetime
+    const t = Date.parse(lic.expires_at);
+    return isNaN(t) ? null : t;
+}
+
+function lwDaysPastExpiry(lic) {
+    const exp = lwExpiryMs(lic);
+    if (exp === null || exp === Infinity) return 0;
+    return Math.floor((Date.now() - exp) / (1000 * 60 * 60 * 24));
+}
+
+function lwOfflineGraceExceeded(lic) {
+    // No recorded successful verification: nothing to extend grace from.
+    if (!lic || !lic.lastVerifiedAt) return true;
+    return (Date.now() - lic.lastVerifiedAt) > LW_OFFLINE_GRACE_MS;
+}
+
+function lwExpiredBeyondGrace(lic) {
+    return lwExpiryMs(lic) !== null && lwExpiryMs(lic) !== Infinity &&
+        Date.now() > lwExpiryMs(lic) && lwDaysPastExpiry(lic) > LW_EXPIRY_GRACE_DAYS;
+}
+
+// Cached license usable? True when: server-verified flag set, not past the
+// expiry grace window, and a successful verification within the last 24h.
+function lwCachedUsable(lic) {
+    if (!lic || lic.valid !== true || !lic.key) return false;
+    if (lwExpiredBeyondGrace(lic)) return false;
+    if (lwOfflineGraceExceeded(lic)) return false;
+    return true;
+}
+
+function lwExpiryLabel(lic) {
+    if (!lic || !lic.expires_at) return "";
+    if (String(lic.expires_at).startsWith("9999")) return " (Lifetime)";
+    try {
+        return " (valid till " + new Date(lic.expires_at).toLocaleDateString() + ")";
+    } catch (e) {
+        return "";
+    }
+}
+
+// Verify one key against the LicenseWala server. Returns
+// { valid: true, license } on a server-verified response, otherwise
+// { valid: false, status, message }. Network failures are reported as
+// status "network_error" and never count as activation.
+async function lwVerifyKey(keyString) {
+    const key = (keyString || "").trim().toUpperCase();
+    if (!key) return { valid: false, status: "invalid", message: "Please enter a license key." };
+
+    const deviceId = await lwGetDeviceId();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch(LW_VERIFY_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: key, hwid: deviceId, deviceName: "HPCL LPG Tech Audit Autofiller" }),
+            signal: controller.signal
+        });
+        const result = await response.json().catch(() => ({}));
+        if (result && result.valid === true) {
+            const lic = {
+                valid: true,
+                key: key,
+                deviceId: deviceId,
+                status: result.status || "active",
+                plan_name: result.plan_name || "",
+                product_name: result.product_name || "",
+                days_left: (typeof result.days_left === "number") ? result.days_left : null,
+                expires_at: result.expires_at || result.trial_ends_at || "",
+                message: result.message || "",
+                lastVerifiedAt: Date.now()
+            };
+            await lwStorageSet({ [LW_STORAGE_KEY]: lic });
+            return { valid: true, license: lic };
+        }
+        return {
+            valid: false,
+            status: (result && result.status) || "invalid",
+            message: (result && result.message) || "Invalid license key. Please check your key or buy a license."
+        };
+    } catch (err) {
+        return { valid: false, status: "network_error", message: "Could not reach the LicenseWala server. Check your connection and try again." };
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+function lwShowMessage(text, ok) {
+    const msgEl = document.getElementById("lw-license-message");
+    if (!msgEl) return;
+    if (!text) {
+        msgEl.textContent = "";
+        msgEl.classList.add("hidden");
+        return;
+    }
+    msgEl.textContent = text;
+    msgEl.classList.toggle("lw-ok", !!ok);
+    msgEl.classList.remove("hidden");
+}
+
+// Apply the current license state to the panel: licensed users get the
+// full panel; everyone else sees the activation UI with autofill disabled.
+function lwApplyLicenseUI() {
+    const statusEl = document.getElementById("lw-license-status");
+    const formEl = document.getElementById("lw-license-form");
+    const removeBtn = document.getElementById("lw-license-remove");
+    const fileInput = document.getElementById("autofill-file-input");
+    const btnStart = document.getElementById("btn-start-autofill");
+    if (!statusEl || !formEl) return;
+
+    if (lwLicensed && lwLicense) {
+        const plan = lwLicense.plan_name ? " — " + lwLicense.plan_name : "";
+        statusEl.textContent = "✅ Licensed" + plan + lwExpiryLabel(lwLicense);
+        statusEl.classList.remove("lw-locked");
+        statusEl.classList.add("lw-ok");
+        formEl.classList.add("hidden");
+        lwShowMessage("", false);
+        if (removeBtn) removeBtn.classList.remove("hidden");
+        if (fileInput) fileInput.disabled = false;
+        if (btnStart && parsedData.length > 0) btnStart.disabled = false;
+    } else {
+        statusEl.textContent = "🔒 " + (lwLockedMessage || "License required — enter your LicenseWala key to unlock autofill.");
+        statusEl.classList.remove("lw-ok");
+        statusEl.classList.add("lw-locked");
+        formEl.classList.remove("hidden");
+        if (removeBtn) removeBtn.classList.add("hidden");
+        if (fileInput) fileInput.disabled = true;
+        if (btnStart) btnStart.disabled = true;
+    }
+    const panel = document.getElementById("hpcl-autofill-panel");
+    if (panel) panel.classList.toggle("lw-locked", !lwLicensed);
+}
+
+function lwLock(message) {
+    lwLicensed = false;
+    if (message) lwLockedMessage = message;
+    stopAutofillProcess();
+    lwApplyLicenseUI();
+}
+
+// Background re-verification. Network failures keep a previously verified
+// user working until the 24h offline grace runs out; a server verdict of
+// invalid/expired/revoked/locked/device-limit locks the panel immediately.
+async function lwReverify() {
+    if (lwReverifying || !lwLicense || !lwLicense.key) return;
+    lwReverifying = true;
+    // Guard against stale results: if the stored license changed (new
+    // activation, removal, expiry handling) while this check was in flight,
+    // its verdict must not overwrite the newer state.
+    const keyAtStart = lwLicense.key;
+    try {
+        const res = await lwVerifyKey(keyAtStart);
+        if (!lwLicense || lwLicense.key !== keyAtStart) return;
+        if (res.valid) {
+            lwLicense = res.license;
+            lwLicensed = true;
+            lwApplyLicenseUI();
+            return;
+        }
+        if (res.status === "network_error") {
+            if (lwOfflineGraceExceeded(lwLicense)) {
+                lwLock("Could not verify your license for over 24 hours. Connect to the internet and click Activate to re-verify.");
+            }
+            return;
+        }
+        await lwStorageRemove(LW_STORAGE_KEY);
+        lwLicense = null;
+        lwLock(res.message);
+    } finally {
+        lwReverifying = false;
+    }
+}
+
+// Runs once after the panel is injected. Fail closed: the panel starts
+// locked and only unlocks on a usable cached license or fresh verification.
+async function lwInitLicense() {
+    // Fail closed on every init: only a usable stored license or a fresh
+    // verification below may set lwLicensed back to true.
+    lwLicensed = false;
+    lwLockedMessage = "";
+    try {
+        const stored = await lwStorageGet(LW_STORAGE_KEY);
+        if (stored && stored.valid === true && stored.key) {
+            lwLicense = stored;
+            if (lwCachedUsable(stored)) {
+                lwLicensed = true;
+            } else if (!lwExpiredBeyondGrace(stored)) {
+                // Offline grace lapsed but the key is not past its expiry
+                // grace window: one live re-verify decides (network failure
+                // keeps it locked until verification succeeds).
+                const res = await lwVerifyKey(stored.key);
+                if (res.valid) {
+                    lwLicense = res.license;
+                    lwLicensed = true;
+                } else if (res.status === "network_error") {
+                    lwLockedMessage = "Could not verify your license. Connect to the internet and click Activate to re-verify.";
+                } else {
+                    await lwStorageRemove(LW_STORAGE_KEY);
+                    lwLicense = null;
+                    lwLockedMessage = res.message;
+                }
+            } else {
+                await lwStorageRemove(LW_STORAGE_KEY);
+                lwLicense = null;
+                lwLockedMessage = "License expired. Please renew to continue using autofill.";
+            }
+        }
+    } catch (e) {
+        lwLicensed = false;
+    }
+    lwApplyLicenseUI();
+    if (lwReverifyTimer) clearInterval(lwReverifyTimer);
+    lwReverifyTimer = setInterval(lwReverify, LW_RECHECK_MS);
+    if (lwLicensed) lwReverify(); // silent background refresh, never blocks the UI
+}
+
+async function lwOnActivate() {
+    const input = document.getElementById("lw-license-key");
+    const btn = document.getElementById("lw-license-activate");
+    if (!input || !btn) return;
+    const key = input.value.trim();
+    if (!key) {
+        lwShowMessage("Please enter a license key.", false);
+        return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Verifying…";
+    try {
+        const res = await lwVerifyKey(key);
+        if (res.valid) {
+            lwLicense = res.license;
+            lwLicensed = true;
+            lwLockedMessage = "";
+            input.value = "";
+            lwApplyLicenseUI();
+            lwShowMessage("License activated. Autofill unlocked.", true);
+        } else {
+            // A failed attempt never overwrites a previously valid license.
+            lwApplyLicenseUI();
+            lwShowMessage(res.message, false);
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Activate";
+    }
+}
+
+async function lwOnRemove() {
+    await lwStorageRemove(LW_STORAGE_KEY);
+    lwLicense = null;
+    lwLockedMessage = "";
+    lwLock("License removed. Enter a key to unlock autofill again.");
+    lwShowMessage("License removed.", false);
+}
+
 // Suppress known jQuery/portal JS script errors on the page to prevent alert blocks
 window.addEventListener("error", function(e) {
     if (e.message && (e.message.includes("Syntax error, unrecognized expression") || e.message.includes("#Name_BIS_LICENCENO#id#") || e.message.includes("#Otherdef#id#"))) {
@@ -56,9 +396,23 @@ function injectAutofillPanel() {
         </div>
         <div id="widget-body" class="widget-body">
             <p class="widget-desc">Upload Regulator defect sheet (.csv) to fill the grid automatically.</p>
-            
+
+            <!-- LicenseWala License Activation (autofill stays locked until verified) -->
+            <div id="lw-license-section" class="lw-license-section">
+                <div id="lw-license-status" class="lw-license-status lw-locked">🔒 License required — enter your LicenseWala key to unlock autofill.</div>
+                <div id="lw-license-form" class="lw-license-form">
+                    <input type="text" id="lw-license-key" placeholder="Enter license key" autocomplete="off" spellcheck="false">
+                    <button id="lw-license-activate" type="button">Activate</button>
+                </div>
+                <div id="lw-license-message" class="lw-license-message hidden"></div>
+                <div class="lw-license-links">
+                    <a href="https://licensescript.netlify.app/" target="_blank" rel="noreferrer">Buy / Renew License</a>
+                    <button id="lw-license-remove" type="button" class="hidden">Remove license</button>
+                </div>
+            </div>
+
             <div class="file-picker-wrapper">
-                <input type="file" id="autofill-file-input" accept=".csv">
+                <input type="file" id="autofill-file-input" accept=".csv" disabled>
                 <label for="autofill-file-input" id="lbl-file-input">
                     📁 Choose CSV File
                 </label>
@@ -134,11 +488,19 @@ function injectAutofillPanel() {
     document.getElementById("btn-cancel-cmls").addEventListener("click", hideCmlEditor);
     document.getElementById("btn-save-cmls").addEventListener("click", saveCmlManualInput);
 
+    // LicenseWala activation bindings (Enter in the key box also activates)
+    document.getElementById("lw-license-activate").addEventListener("click", lwOnActivate);
+    document.getElementById("lw-license-key").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); lwOnActivate(); }
+    });
+    document.getElementById("lw-license-remove").addEventListener("click", lwOnRemove);
+
     // Initial render of CML list
     renderCmlList();
 
-    // Restore state if saved in localStorage
-    restoreStateFromStorage();
+    // License check first (fail closed), then restore any saved autofill
+    // state — restore only enables Start when the license is valid.
+    lwInitLicense().finally(() => restoreStateFromStorage());
 }
 
 function toggleWidget() {
@@ -370,6 +732,105 @@ function injectStyles() {
             line-height: 1.4;
         }
         
+        /* LicenseWala license section */
+        .lw-license-section {
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.25);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .lw-license-status {
+            font-size: 11px;
+            line-height: 1.4;
+        }
+
+        .lw-license-status.lw-ok {
+            color: #10b981;
+        }
+
+        .lw-license-status.lw-locked {
+            color: #fbbf24;
+        }
+
+        .lw-license-form {
+            display: flex;
+            gap: 6px;
+        }
+
+        .lw-license-form input {
+            flex: 1;
+            min-width: 0;
+            background: #0b0f19;
+            border: 1px solid #374151;
+            color: #f3f4f6;
+            font-size: 11px;
+            padding: 8px;
+            border-radius: 6px;
+            outline: none;
+        }
+
+        .lw-license-form input:focus {
+            border-color: #3b82f6;
+        }
+
+        .lw-license-form button {
+            background: #2563eb;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .lw-license-form button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .lw-license-message {
+            font-size: 11px;
+            color: #f87171;
+            line-height: 1.4;
+        }
+
+        .lw-license-message.lw-ok {
+            color: #10b981;
+        }
+
+        .lw-license-links {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .lw-license-links a {
+            font-size: 11px;
+            color: #60a5fa;
+        }
+
+        #lw-license-remove {
+            background: transparent;
+            border: none;
+            color: #9ca3af;
+            font-size: 11px;
+            cursor: pointer;
+            text-decoration: underline;
+            padding: 0;
+        }
+
+        #hpcl-autofill-panel.lw-locked #lbl-file-input {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+
         .hidden {
             display: none !important;
         }
@@ -381,6 +842,13 @@ function injectStyles() {
 // 2. CSV Parser Engine
 // ==========================================================================
 function handleFileSelected(e) {
+    // Defense in depth: the file input is disabled while locked, but never
+    // accept a sheet without a valid license.
+    if (!lwLicensed) {
+        e.target.value = "";
+        alert("Please activate your LicenseWala license first.");
+        return;
+    }
     const file = e.target.files[0];
     if (!file) return;
 
@@ -754,6 +1222,10 @@ function determineRemarksFromDefect(defectType) {
 // 3. Browser Automation Core
 // ==========================================================================
 async function startAutofillProcess() {
+    if (!lwLicensed) {
+        alert("Please activate your LicenseWala license first.");
+        return;
+    }
     if (parsedData.length === 0) return;
     
     isAutofilling = true;
@@ -1121,7 +1593,8 @@ function restoreStateFromStorage() {
             fileNameEl.textContent = savedFileName;
             fileRowsEl.textContent = `${parsedData.length} records loaded`;
             fileInfo.classList.remove("hidden");
-            btnStart.disabled = false;
+            // Only re-enable Start for a valid license; locked panels stay locked.
+            btnStart.disabled = !lwLicensed;
             
             const nextBatchEnd = Math.min(currentFillIndex + BATCH_SIZE, parsedData.length);
             if (currentFillIndex > 0) {
