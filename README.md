@@ -63,6 +63,17 @@ deployment, and self-hosted updates via `updates.xml`. See
 > After a version update, the packaged install only picks up the new
 > version once the CRX and `updates.xml` are rebuilt for that release.
 
+## Incognito mode
+
+The autofiller also works in Incognito windows:
+
+1. Open `chrome://extensions`, find this extension, and turn on
+   **Allow in Incognito**. (Chrome keeps this off by default, and no
+   extension can turn it on by itself.)
+2. That's it — the license you activated in a normal window works in
+   Incognito too, because the extension shares one license state
+   (`"incognito": "spanning"` in the manifest).
+
 ## License activation
 
 A valid **LicenseWala subscription license** is required. Keys are

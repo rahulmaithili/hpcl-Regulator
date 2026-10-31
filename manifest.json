@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "incognito": "spanning",
   "name": "HPCL LPG Tech Audit Autofiller",
   "version": "1.1.1",
   "update_url": "https://rahulmaithili.github.io/hpcl-Regulator/updates.xml",
